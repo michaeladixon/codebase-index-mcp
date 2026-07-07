@@ -1,0 +1,29 @@
+{
+  "//": "Merge into your user settings.json (Windows: C:\\Users\\<you>\\.claude\\settings.json). First copy enforcement/hooks/index_guard.py and enforcement/hooks/sessionstart_index.py to C:\\Users\\<you>\\.claude\\hooks\\. WARNING: replace C:\\Users\\<you> with your literal home path -- Claude Code does NOT expand %USERPROFILE% in hook commands, and an unresolvable script path makes python exit 2, which BLOCKS all matched tool calls. On Windows the interpreter is `python`, not `python3`. Prefer running install/install.ps1, which writes the expanded path for you.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Read|Grep|Glob",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"C:\\Users\\<you>\\.claude\\hooks\\index_guard.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"C:\\Users\\<you>\\.claude\\hooks\\sessionstart_index.py\"",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codebase-index-mcp"
+version = "0.1.0"
+description = "Token-efficient MCP server: symbol-level codebase index replacing raw Read/Grep/Glob"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.2",
+    "tree-sitter>=0.21",
+    # 1.x is a rewritten package with an incompatible (non tree_sitter) API
+    "tree-sitter-language-pack>=0.4,<1",
+]
+
+[project.optional-dependencies]
+gitignore = ["pathspec>=0.11"]
+dev = ["pytest>=7"]
+
+[project.scripts]
+codebase-index-mcp = "codebase_index.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

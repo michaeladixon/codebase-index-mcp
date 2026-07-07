@@ -1,0 +1,17 @@
+{
+  "//": "Merge into <project>/.claude/settings.json (project settings win over user settings). First copy enforcement/hooks/index_guard.py to <project>/.claude/hooks/index_guard.py. $CLAUDE_PROJECT_DIR is set by Claude Code when the hook runs. On Windows, if `python3` is not on PATH, change the command to: python \"%CLAUDE_PROJECT_DIR%\\.claude\\hooks\\index_guard.py\"",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Read|Grep|Glob",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/index_guard.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

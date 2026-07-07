@@ -1,0 +1,28 @@
+# codebase-index runtime artifacts
+.codebase-index/
+index-all.log
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# OS / editor
+Thumbs.db
+Desktop.ini
+.DS_Store
+.idea/
+.vs/
+.vscode/
+
+# local settings backups
+*.bak-*
