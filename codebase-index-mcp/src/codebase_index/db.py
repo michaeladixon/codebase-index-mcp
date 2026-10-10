@@ -9,6 +9,16 @@ from pathlib import Path
 DB_DIR = ".codebase-index"
 DB_NAME = "index.db"
 
+# Bump whenever the schema, the FTS tokenizers or the symbol extractor change.
+# A DB written by a different version is dropped and rebuilt on open, so stale
+# or partially-parsed rows from an older build can never linger.
+INDEX_VERSION = "2"
+
+# Seconds a writer waits for another process's write lock before giving up.
+BUSY_TIMEOUT = 30.0
+
+_TABLES = ("files", "symbols", "refs", "imports", "symbols_fts", "files_fts")
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS files(
     id INTEGER PRIMARY KEY,
@@ -52,10 +62,12 @@ CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
 CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(
     name, qualname, signature, doc, tokenize="unicode61 tokenchars '_'"
 );
-CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
-    content, tokenize="unicode61 tokenchars '_'"
-);
 """
+
+# File contents. The trigram tokenizer makes MATCH a true substring search
+# (grep parity); SQLite builds without it fall back to word tokens, in which
+# case queries scan the stored content instead of trusting the FTS prefilter.
+_FILES_FTS = "CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(content, tokenize=\"%s\")"
 
 
 def db_path(root: Path) -> Path:
@@ -68,6 +80,39 @@ def _fallback_path(root: Path) -> Path:
     return Path(tempfile.gettempdir()) / "codebase-index" / f"{key}.db"
 
 
+def _create_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(SCHEMA)
+    try:
+        conn.execute(_FILES_FTS % "trigram")
+    except sqlite3.OperationalError:  # SQLite < 3.34: no trigram tokenizer
+        conn.execute(_FILES_FTS % "unicode61 tokenchars '_'")
+
+
+def fts_mode(conn: sqlite3.Connection) -> str:
+    """'trigram' if files_fts supports substring MATCH, else 'token'."""
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE name='files_fts'").fetchone()
+    return "trigram" if row and "trigram" in (row[0] or "") else "token"
+
+
+def _ensure_version(conn: sqlite3.Connection) -> None:
+    """Drop and recreate everything if the DB was written by another version."""
+    if get_meta(conn, "index_version") == INDEX_VERSION:
+        return
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if get_meta(conn, "index_version") != INDEX_VERSION:  # re-check under lock
+            for t in _TABLES:
+                conn.execute(f"DROP TABLE IF EXISTS {t}")
+            conn.execute("DELETE FROM meta")
+            _create_schema(conn)
+            set_meta(conn, "index_version", INDEX_VERSION)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+
+
 def _open(p: Path) -> sqlite3.Connection:
     """Open one DB file; WAL if the fs supports it, else TRUNCATE journal.
 
@@ -75,19 +120,30 @@ def _open(p: Path) -> sqlite3.Connection:
     filesystems refuse; TRUNCATE needs neither.
     """
     p.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(p))
+    conn = sqlite3.connect(str(p), timeout=BUSY_TIMEOUT)
     conn.row_factory = sqlite3.Row
     try:
         conn.execute("PRAGMA journal_mode=WAL")
-        conn.executescript(SCHEMA)
+        _create_schema(conn)
     except sqlite3.OperationalError:
         conn.close()
-        conn = sqlite3.connect(str(p))
+        conn = sqlite3.connect(str(p), timeout=BUSY_TIMEOUT)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=TRUNCATE")
-        conn.executescript(SCHEMA)
+        _create_schema(conn)
     conn.execute("PRAGMA synchronous=NORMAL")
+    _ensure_version(conn)
     return conn
+
+
+def _self_ignore(index_dir: Path) -> None:
+    """Keep the index (a full-text copy of the repo) out of version control."""
+    gi = index_dir / ".gitignore"
+    try:
+        if not gi.exists():
+            gi.write_text("*\n", encoding="utf-8")
+    except OSError:
+        pass
 
 
 def connect(root: Path) -> sqlite3.Connection:
@@ -98,7 +154,9 @@ def connect(root: Path) -> sqlite3.Connection:
     per-root DB in the system temp dir so queries still work.
     """
     try:
-        return _open(db_path(Path(root)))
+        conn = _open(db_path(Path(root)))
+        _self_ignore(db_path(Path(root)).parent)
+        return conn
     except (sqlite3.OperationalError, sqlite3.DatabaseError, OSError):
         return _open(_fallback_path(root))
 

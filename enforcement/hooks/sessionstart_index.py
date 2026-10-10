@@ -84,6 +84,11 @@ def main():
 
         idx_dir = os.path.join(root, ".codebase-index")
         os.makedirs(idx_dir, exist_ok=True)
+        # The index is a full-text copy of the repo: keep it out of git.
+        ignore = os.path.join(idx_dir, ".gitignore")
+        if not os.path.exists(ignore):
+            with open(ignore, "w", encoding="utf-8") as f:
+                f.write("*\n")
         log_path = os.path.join(idx_dir, "last-index.log")
 
         kwargs = {}

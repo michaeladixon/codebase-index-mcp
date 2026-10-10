@@ -28,7 +28,7 @@ Three cooperating layers, roughly ten moving parts:
 3. **Enforcement hook** (`enforcement/hooks/index_guard.py`) — a PreToolUse hook that
    denies raw Read/Grep of indexed code files and redirects Claude to the index tools.
    It is inert on unindexed projects, always allows non-code files (configs, docs,
-   markdown) and surgical reads (explicit offset + limit ≤ 120 lines), and fails open
+   markdown) and surgical reads (explicit limit ≤ 120 lines), and fails open
    on any error.
 4. **Policy file** (`enforcement/CLAUDE-policy.md`) — appended to your project's
    `CLAUDE.md`; tells Claude the escalation order (metadata → single symbol → full read).
@@ -97,8 +97,8 @@ it), and optionally `claude mcp remove codebase-index`. Deleting a project's
   stdio isn't buffered. Test manually: `python -m codebase_index --help`.
 - **Stale answers** (moved/renamed symbols) — re-run the indexer:
   `python -m codebase_index index <project> --full`, or ask Claude to call `reindex`.
-- **Hook blocks a file you genuinely need** — read it with an explicit offset/limit
-  (≤120 lines), use `read_span`, or set `INDEX_GUARD_DISABLE=1` for the session.
+- **Hook blocks a file you genuinely need** — read it with an explicit limit
+  (≤120 lines, plus an offset as needed), use `read_span`, or set `INDEX_GUARD_DISABLE=1` for the session.
 - **`pip install` refused (externally-managed environment)** — the shell installer
   retries with `--user --break-system-packages`; on Windows use a normal python.org
   install or a venv.

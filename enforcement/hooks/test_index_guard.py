@@ -120,6 +120,13 @@ def test_allow_surgical_read(project):
     assert_allowed(proc)
 
 
+def test_allow_limit_only_read(project):
+    """A bare limit (no offset) is just as surgical as offset + limit."""
+    proc = run_hook(event(
+        "Read", {"file_path": str(project / "src" / "app.py"), "limit": 50}, project))
+    assert_allowed(proc)
+
+
 def test_deny_oversized_windowed_read(project):
     proc = run_hook(event(
         "Read",

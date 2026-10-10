@@ -33,7 +33,7 @@ EXT_LANG = {
     ".lua": "lua",
     ".sh": "bash", ".bash": "bash",
     ".pl": "perl", ".pm": "perl",
-    ".r": "r", ".R": "r",
+    ".r": "r",
     ".jl": "julia",
     ".ex": "elixir", ".exs": "elixir",
     ".erl": "erlang", ".hrl": "erlang",
@@ -390,6 +390,14 @@ def extract(lang: str, root_node, src: bytes):
                     anchor = node.parent
                 qual = (symbols[parent]["qualname"] + "." + name) \
                     if parent is not None else name
+                if lang == "go" and t == "method_declaration":
+                    # func (s *Server) Run() -> Server.Run
+                    recv = node.child_by_field_name("receiver")
+                    rts = _descendants_of_type(recv, "type_identifier") \
+                        if recv is not None else []
+                    if rts:
+                        rt = min(rts, key=lambda n: n.start_byte)
+                        qual = _text(rt, src) + "." + name
                 symbols.append({
                     "name": name, "qualname": qual, "kind": kind,
                     "start": anchor.start_point[0] + 1,

@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import os
+import posixpath
 import re
+import sqlite3
 import time
 from collections import defaultdict, deque
 from pathlib import Path
@@ -34,6 +36,13 @@ ENTRY_NAMES = {"main.py", "__main__.py", "app.py", "manage.py", "cli.py",
                "main.java", "application.java", "main.kt", "main.swift"}
 
 
+PER_FILE_HITS = 3   # content lines shown per file by search (rest are counted)
+MAX_OVERLOADS = 6
+LANG_FAMILY = {"javascript": "js", "typescript": "js", "tsx": "js",
+               "c": "c", "cpp": "c"}
+BUILD_NOTE = "(index build in progress; results may be incomplete)"
+
+
 def _fts_quote(query: str) -> str:
     toks = re.findall(r"[A-Za-z0-9_]+", query)
     return " ".join(f'"{t}"' for t in toks[:8])
@@ -45,31 +54,50 @@ class Queries:
         self.indexer = Indexer(self.root)
         self.conn = self.indexer.conn
         self._last_check = 0.0
+        self._fts_mode: str | None = None
 
     # ------------------------------------------------------------ plumbing
 
     def ensure_indexed(self) -> None:
         n = self.conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
-        if n == 0:
+        # If another process (e.g. the SessionStart hook) is already building,
+        # don't start a competing run; queries carry BUILD_NOTE meanwhile.
+        if n == 0 and not self.indexer.building():
             self.indexer.index()
             self._last_check = time.time()
+
+    def note(self) -> str:
+        """Non-empty while the index is being built by any process."""
+        try:
+            return BUILD_NOTE if self.indexer.building() else ""
+        except Exception:
+            return ""
+
+    def _refresh_one(self, file: str) -> bool:
+        try:
+            return bool(self.indexer.refresh_file(file))
+        except Exception:
+            return False
 
     def _refresh(self, file: str | None = None) -> None:
         """Lazy staleness handling: per-file check, plus a global scan <=1/30s."""
         if file:
-            try:
-                self.indexer.refresh_file(file)
-            except Exception:
-                pass
+            self._refresh_one(file)
         now = time.time()
         if now - self._last_check > 30:
             self._last_check = now
             try:
-                self.indexer.index()
+                if not self.indexer.building():
+                    self.indexer.index()
             except Exception:
                 pass
 
     def _norm(self, path: str) -> str:
+        """Project-relative POSIX path ('' for the root itself).
+
+        A path outside the root is returned still absolute or starting with
+        '..'; it matches nothing in the index and _inside() rejects it.
+        """
         p = (path or "").strip().replace("\\", "/")
         if not p:
             return ""
@@ -78,8 +106,49 @@ class Queries:
             if ap.is_absolute():
                 p = ap.resolve().relative_to(self.root).as_posix()
         except Exception:
-            pass
-        return p.lstrip("./") if p not in (".", "./") else ""
+            return p
+        p = posixpath.normpath(p)
+        return "" if p == "." else p
+
+    def _inside(self, rel: str) -> Path | None:
+        """Absolute path for rel if it resolves inside the project root."""
+        try:
+            full = (self.root / rel).resolve()
+            full.relative_to(self.root)
+        except Exception:
+            return None
+        return full
+
+    def _scope_cond(self, scope_rel: str):
+        """SQL fragment + args restricting f.path to a file or directory."""
+        if not scope_rel:
+            return "", []
+        return (" AND (f.path=? OR substr(f.path,1,?)=?)",
+                [scope_rel, len(scope_rel) + 1, scope_rel + "/"])
+
+    def _candidates(self, literals, scope_rel: str = ""):
+        """(id, path) rows of files that may contain every literal.
+
+        With the trigram index this is an exact substring prefilter for
+        literals of 3+ chars; otherwise every file in scope is a candidate
+        and the caller's line scan decides.
+        """
+        cond, args = self._scope_cond(scope_rel)
+        if self._fts_mode is None:
+            self._fts_mode = db.fts_mode(self.conn)
+        lits = [l for l in literals if len(l) >= 3]
+        if lits and self._fts_mode == "trigram":
+            match = " AND ".join('"%s"' % l.replace('"', '""') for l in lits)
+            try:
+                return self.conn.execute(
+                    "SELECT f.id, f.path FROM files_fts t JOIN files f "
+                    "ON f.id=t.rowid WHERE files_fts MATCH ?" + cond +
+                    " ORDER BY f.path", [match] + args).fetchall()
+            except sqlite3.Error:
+                pass
+        return self.conn.execute(
+            "SELECT f.id, f.path FROM files f WHERE 1=1" + cond +
+            " ORDER BY f.path", args).fetchall()
 
     def _file_row(self, rel: str):
         return self.conn.execute(
@@ -145,7 +214,9 @@ class Queries:
                 f"  {s['signature'] or ''}".rstrip())
 
     def _read_lines(self, rel: str, start: int, end: int) -> str:
-        full = self.root / rel
+        full = self._inside(rel)
+        if full is None:
+            return f"error: outside project root: {rel}"
         try:
             lines = full.read_text(encoding="utf-8", errors="replace") \
                 .splitlines()
@@ -232,11 +303,11 @@ class Queries:
                 out.append(f"... +{len(syms) - 200} more")
             return "\n".join(out)
         # directory outline
-        like = rel + "/%" if rel else "%"
+        cond, args = self._scope_cond(rel)
         rows = self.conn.execute(
             "SELECT f.path, f.lang, f.loc, COUNT(s.id) AS n FROM files f "
-            "LEFT JOIN symbols s ON s.file_id=f.id WHERE f.path LIKE ? "
-            "GROUP BY f.id ORDER BY f.path", (like,)).fetchall()
+            "LEFT JOIN symbols s ON s.file_id=f.id WHERE 1=1" + cond +
+            " GROUP BY f.id ORDER BY f.path", args).fetchall()
         if not rows:
             return f"not indexed: {path or '.'}"
         out = [f"{rel or '.'}/ ({len(rows)} files)"]
@@ -263,114 +334,189 @@ class Queries:
 
     def function_source(self, name: str, file: str = "") -> str:
         self._refresh()
-        rows = self._find_syms(name, kinds=FUNC_KINDS + ("constructor",),
-                               file=file or None)
+        want = (name or "").strip().lower()
+        rows = []
+        for attempt in (0, 1):
+            rows = self._find_syms(name, kinds=FUNC_KINDS + ("constructor",),
+                                   file=file or None)
+            if not rows:
+                any_rows = self._find_syms(name, file=file or None)
+                if any_rows:
+                    return ("no function/method match; other symbols:\n" +
+                            "\n".join(self._sym_line(s) for s in any_rows[:10]))
+                return f"not found: {name}"
+            if len(rows) > 1:
+                pick = [r for r in rows if r["qualname"].lower() == want] or rows
+                # Same qualname in the same file = overloads: return them all.
+                if len({(r["path"], r["qualname"]) for r in pick}) == 1:
+                    rows = sorted(pick, key=lambda r: r["start"])
+                else:
+                    return ("ambiguous, specify qualname or file:\n" +
+                            "\n".join(self._sym_line(s) for s in pick[:10]))
+            # The file may have been edited since it was indexed; if the
+            # refresh reparsed it, the row's line numbers are stale: look up again.
+            if attempt == 0 and any(
+                    [self._refresh_one(p) for p in {r["path"] for r in rows}]):
+                continue
+            break
+        out = []
+        for s in rows[:MAX_OVERLOADS]:
+            src = self._read_lines(s["path"], s["start"], s["end"])
+            out.append(f"{s['path']}:{s['start']}-{s['end']}\n{src}")
+        if len(rows) > MAX_OVERLOADS:
+            out.append(f"... +{len(rows) - MAX_OVERLOADS} more overloads:\n" +
+                       "\n".join(self._sym_line(s)
+                                 for s in rows[MAX_OVERLOADS:]))
+        return "\n\n".join(out)
+
+    def _pick_class(self, name: str, file: str):
+        """Resolve a class-like symbol. Returns (row, impl_rows) or an error str.
+
+        Rust-style `impl` blocks share the type's name; they are attached to
+        the type instead of making the lookup ambiguous.
+        """
+        rows = self._find_syms(name, kinds=CLASS_KINDS, file=file or None)
         if not rows:
-            any_rows = self._find_syms(name, file=file or None)
-            if any_rows:
-                return ("no function/method match; other symbols:\n" +
-                        "\n".join(self._sym_line(s) for s in any_rows[:10]))
-            return f"not found: {name}"
-        if len(rows) > 1:
-            exact = [r for r in rows if r["qualname"].lower() == name.lower()]
-            if len(exact) == 1:
-                rows = exact
-            else:
-                return ("ambiguous, specify qualname or file:\n" +
-                        "\n".join(self._sym_line(s) for s in rows[:10]))
-        s = rows[0]
-        self._refresh(s["path"])
-        src = self._read_lines(s["path"], s["start"], s["end"])
-        return f"{s['path']}:{s['start']}-{s['end']}\n{src}"
+            return f"no class/struct/interface named '{name}'"
+        want = (name or "").strip().lower()
+        exact = [r for r in rows if r["name"].lower() == want
+                 or r["qualname"].lower() == want] or rows
+        primary = [r for r in exact if r["kind"] != "impl"]
+        if len(primary) == 1:
+            s = primary[0]
+        elif len(exact) == 1 or (
+                not primary and len({r["qualname"] for r in exact}) == 1):
+            s = exact[0]
+        else:
+            return ("ambiguous, specify file:\n" +
+                    "\n".join(self._sym_line(r) for r in (primary or exact)[:10]))
+        impls = [r for r in exact if r["kind"] == "impl"
+                 and r["id"] != s["id"] and r["qualname"] == s["qualname"]]
+        return s, impls
+
+    def _members(self, s):
+        """Member rows of a class-like symbol (incl. Go receiver methods)."""
+        kids = self.conn.execute(
+            "SELECT s.*, f.path AS path FROM symbols s JOIN files f "
+            "ON f.id=s.file_id WHERE s.parent_id=? ORDER BY s.start",
+            (s["id"],)).fetchall()
+        lang = self.conn.execute(
+            "SELECT lang FROM files WHERE id=?", (s["file_id"],)).fetchone()
+        if lang and lang[0] == "go":
+            prefix = s["name"] + "."
+            pkg = posixpath.dirname(s["path"])
+            kids += [r for r in self.conn.execute(
+                "SELECT s.*, f.path AS path FROM symbols s JOIN files f "
+                "ON f.id=s.file_id WHERE s.kind='method' AND f.lang='go' "
+                "AND s.parent_id IS NULL AND substr(s.qualname,1,?)=? "
+                "ORDER BY f.path, s.start", (len(prefix), prefix))
+                if posixpath.dirname(r["path"]) == pkg]
+        return kids
 
     def class_source(self, name: str, file: str = "",
                      full: bool = False) -> str:
         self._refresh()
-        rows = self._find_syms(name, kinds=CLASS_KINDS, file=file or None)
-        if not rows:
-            return f"no class/struct/interface named '{name}'"
-        if len(rows) > 1:
-            exact = [r for r in rows if r["name"].lower() == name.lower()
-                     or r["qualname"].lower() == name.lower()]
-            if len(exact) == 1:
-                rows = exact
-            else:
-                return ("ambiguous, specify file:\n" +
-                        "\n".join(self._sym_line(s) for s in rows[:10]))
-        s = rows[0]
-        self._refresh(s["path"])
+        picked = None
+        for attempt in (0, 1):
+            picked = self._pick_class(name, file)
+            if isinstance(picked, str):
+                return picked
+            s, impls = picked
+            paths = {s["path"]} | {i["path"] for i in impls}
+            if attempt == 0 and any([self._refresh_one(p) for p in paths]):
+                continue  # line numbers were stale: look up again
+            break
+        s, impls = picked
         if full:
-            body = self._read_lines(s["path"], s["start"], s["end"])
-            lines = body.splitlines()
+            chunks = [f"{b['path']}:{b['start']}-{b['end']}\n" +
+                      self._read_lines(b["path"], b["start"], b["end"])
+                      for b in [s] + impls]
+            lines = "\n\n".join(chunks).splitlines()
             if len(lines) > 400:
-                body = "\n".join(lines[:400]) + \
+                return "\n".join(lines[:400]) + \
                     f"\n... +{len(lines) - 400} lines (use read_span)"
-            return f"{s['path']}:{s['start']}-{s['end']}\n{body}"
-        out = [f"{s['path']}:{s['start']}-{s['end']} {s['signature']}"]
-        if s["doc"]:
-            out.append("  # " + s["doc"].splitlines()[0][:100])
-        kids = self.conn.execute(
-            "SELECT * FROM symbols WHERE parent_id=? ORDER BY start",
-            (s["id"],)).fetchall()
-        for k in kids[:100]:
-            out.append(f"  {k['start']}: {k['signature'] or k['name']} ...")
-        if not kids:
-            out.append("  (no member symbols indexed)")
+            return "\n".join(lines)
+        out = []
+        for b in [s] + impls:
+            out.append(f"{b['path']}:{b['start']}-{b['end']} {b['signature']}")
+            if b["doc"]:
+                out.append("  # " + b["doc"].splitlines()[0][:100])
+            kids = self._members(b)
+            for k in kids[:100]:
+                where = f"{k['start']}" if k["path"] == b["path"] \
+                    else f"{k['path']}:{k['start']}"
+                out.append(f"  {where}: {k['signature'] or k['name']} ...")
+            if len(kids) > 100:
+                out.append(f"  ... +{len(kids) - 100} more members")
+            if not kids and not impls:
+                out.append("  (no member symbols indexed)")
         return "\n".join(out)
 
-    def search(self, query: str, scope: str = "", max_results: int = 20) -> str:
+    def search(self, query: str, scope: str = "", max_results: int = 20,
+               regex: bool = False) -> str:
+        """Substring search (default) or Python-regex search over file lines.
+
+        Default mode is case-insensitive: a line matches if it contains the
+        whole query, or every word of it. regex=True is case-sensitive
+        (prefix the pattern with (?i) otherwise).
+        """
         self._refresh()
-        q = _fts_quote(query)
-        if not q:
+        query = (query or "").strip()
+        if not query:
             return "empty query"
         scope_rel = self._norm(scope)
-        out = []
-        # symbol name hits
         try:
-            srows = self.conn.execute(
-                "SELECT rowid FROM symbols_fts WHERE symbols_fts MATCH ? "
-                "LIMIT 8", (q,)).fetchall()
-        except Exception:
-            srows = []
-        if srows:
-            ids = [r[0] for r in srows]
-            qs = ",".join("?" * len(ids))
+            max_results = max(1, min(int(max_results), 200))
+        except (TypeError, ValueError):
+            max_results = 20
+        toks = [t.lower() for t in re.findall(r"[A-Za-z0-9_]+", query)]
+        if regex:
+            try:
+                rx = re.compile(query)
+            except re.error as e:
+                return f"bad regex: {e}"
+            literals: list[str] = []  # no safe prefilter for arbitrary regex
+
+            def match(line: str) -> bool:
+                return rx.search(line) is not None
+        else:
+            raw = query.lower()
+            literals = toks
+
+            def match(line: str) -> bool:
+                low = line.lower()
+                return raw in low or bool(toks) and all(t in low for t in toks)
+        out = []
+        # symbol hits: every word is a substring of the qualified name
+        if toks and not regex:
+            cond, args = self._scope_cond(scope_rel)
+            where = " AND ".join("instr(lower(s.qualname), ?)>0" for _ in toks)
             for s in self.conn.execute(
-                    f"SELECT s.*, f.path AS path FROM symbols s JOIN files f "
-                    f"ON s.file_id=f.id WHERE s.id IN ({qs})", ids):
-                if scope_rel and not s["path"].startswith(scope_rel):
-                    continue
+                    "SELECT s.*, f.path AS path FROM symbols s JOIN files f "
+                    "ON s.file_id=f.id WHERE " + where + cond +
+                    " ORDER BY length(s.name), s.qualname, f.path LIMIT 8",
+                    toks + args):
                 out.append("sym: " + self._sym_line(s))
         # content hits
-        try:
-            frows = self.conn.execute(
-                "SELECT f.id, f.path FROM files_fts t JOIN files f "
-                "ON f.id=t.rowid WHERE files_fts MATCH ? LIMIT 200",
-                (q,)).fetchall()
-        except Exception:
-            frows = []
-        toks = [t.lower() for t in re.findall(r"[A-Za-z0-9_]+", query)]
-        raw = query.strip().lower()
-        shown, more_files = 0, 0
-        for fid, path in frows:
-            if scope_rel and not path.startswith(scope_rel):
-                continue
+        shown, unscanned = 0, 0
+        for fid, path in self._candidates(literals, scope_rel):
             if shown >= max_results:
-                more_files += 1
+                unscanned += 1
                 continue
-            content = self._content(fid)
-            hits = []
-            for i, line in enumerate(content.splitlines(), 1):
-                low = line.lower()
-                if raw in low or all(t in low for t in toks):
-                    hits.append((i, line.strip()[:120]))
-            for i, txt in hits[:3]:
-                if shown >= max_results:
-                    break
+            hits = [(i, line.strip()[:120]) for i, line in
+                    enumerate(self._content(fid).splitlines(), 1)
+                    if match(line)]
+            if not hits:
+                continue
+            take = hits[:min(PER_FILE_HITS, max_results - shown)]
+            for i, txt in take:
                 out.append(f"{path}:{i}: {txt}")
-                shown += 1
-        if more_files:
-            out.append(f"... +{more_files} more files match")
+            shown += len(take)
+            if len(hits) > len(take):
+                out.append(f"{path}: +{len(hits) - len(take)} more matching lines")
+        if unscanned:
+            out.append(f"... +{unscanned} more files may match "
+                       f"(narrow scope or raise max_results)")
         return "\n".join(out) if out else f"no matches for '{query}'"
 
     def dependencies(self, target: str) -> str:
@@ -444,14 +590,9 @@ class Queries:
             if (r["file_id"], r["line"]) in def_lines:
                 continue
             hits[(r["path"], r["line"])] = (r["file_id"], r["kind"])
-        # FTS fallback for usages the ref extractor missed (grep parity)
-        try:
-            frows = self.conn.execute(
-                "SELECT f.id, f.path FROM files_fts t JOIN files f "
-                "ON f.id=t.rowid WHERE files_fts MATCH ? LIMIT 100",
-                (f'"{leaf}"',)).fetchall()
-        except Exception:
-            frows = []
+        # Text fallback for usages the ref extractor missed (grep parity).
+        # Names under 3 chars are skipped: too noisy to match as bare words.
+        frows = self._candidates([leaf]) if len(leaf) >= 3 else []
         pat = re.compile(r"\b" + re.escape(leaf) + r"\b")
         for fid, path in frows:
             for i, line in enumerate(self._content(fid).splitlines(), 1):
@@ -475,42 +616,62 @@ class Queries:
     # --------------------------------------------------------- call graph
 
     def _call_graph(self):
-        """caller qualname -> set of callee names (lexical)."""
+        """Lexical call graph keyed by symbol id (not by name).
+
+        Returns (funcs, edges, by_name): funcs[id] = (qualname, lang family),
+        edges[caller id] = callee names, by_name[name or qualname] = ids.
+        Keying by id keeps same-named functions in different files apart.
+        """
+        funcs, by_name = {}, defaultdict(set)
+        for r in self.conn.execute(
+                "SELECT s.id, s.qualname, s.name, f.lang FROM symbols s "
+                "JOIN files f ON f.id=s.file_id "
+                "WHERE s.kind IN ('function','method')"):
+            funcs[r["id"]] = (r["qualname"],
+                              LANG_FAMILY.get(r["lang"], r["lang"]))
+            by_name[r["name"]].add(r["id"])
+            by_name[r["qualname"]].add(r["id"])
         edges = defaultdict(set)
-        for caller, callee in self.conn.execute(
-                "SELECT s.qualname, r.name FROM refs r JOIN symbols s "
+        for sid, callee in self.conn.execute(
+                "SELECT s.id, r.name FROM refs r JOIN symbols s "
                 "ON s.file_id=r.file_id AND r.line BETWEEN s.start AND s.end "
                 "WHERE r.kind='call' AND s.kind IN ('function','method')"):
-            edges[caller].add(callee)
-        by_name = defaultdict(set)
-        for q, in self.conn.execute(
-                "SELECT DISTINCT qualname FROM symbols "
-                "WHERE kind IN ('function','method')"):
-            by_name[q.split(".")[-1]].add(q)
-            by_name[q].add(q)
-        return edges, by_name
+            edges[sid].add(callee)
+        return funcs, edges, by_name
 
     def call_chain(self, frm: str, to: str, max_depth: int = 6) -> str:
         self._refresh()
-        edges, by_name = self._call_graph()
-        starts = by_name.get(frm, set()) | by_name.get(frm.split(".")[-1], set())
-        targets = by_name.get(to, set()) | by_name.get(to.split(".")[-1], set())
+        funcs, edges, by_name = self._call_graph()
+
+        def ids(name: str) -> set:
+            name = (name or "").strip()
+            return by_name.get(name) or by_name.get(name.split(".")[-1], set())
+
+        starts, targets = ids(frm), ids(to)
         if not starts:
             return f"unknown start symbol: {frm}"
         if not targets:
             return f"unknown target symbol: {to}"
-        tleafs = {t.split(".")[-1] for t in targets}
+
+        def order(i):
+            return (funcs[i][0], i)
+
         paths, seen = [], set()
-        dq = deque([(s, (s,)) for s in sorted(starts)])
+        dq = deque([(s, (s,)) for s in sorted(starts, key=order)])
         while dq and len(paths) < 5:
             node, path = dq.popleft()
             if len(path) > max_depth:
                 continue
+            family = funcs[node][1]
             for callee in sorted(edges.get(node, ())):
-                if callee in tleafs or callee in targets:
-                    paths.append(path + (callee,))
+                # a call can only land on a definition in the same language
+                cands = sorted((c for c in by_name.get(callee, ())
+                                if funcs[c][1] == family), key=order)
+                hit = [c for c in cands if c in targets]
+                if hit:
+                    paths.append(path + (hit[0],))
                     continue
-                for nxt in sorted(by_name.get(callee, ())):
+                for nxt in cands:
                     if nxt in path or (node, nxt) in seen:
                         continue
                     seen.add((node, nxt))
@@ -518,7 +679,11 @@ class Queries:
         if not paths:
             return (f"no call path {frm} -> {to} "
                     f"(depth<={max_depth}, lexical name-based)")
-        out = [" -> ".join(p) for p in paths[:5]]
+        out = []
+        for p in paths[:5]:
+            line = " -> ".join(funcs[i][0] for i in p)
+            if line not in out:
+                out.append(line)
         out.append("(lexical name-based, best-effort)")
         return "\n".join(out)
 
@@ -527,10 +692,25 @@ class Queries:
         rel = self._norm(target)
         row = self._file_row(rel)
         if row:
-            names = [r[0] for r in self.conn.execute(
-                "SELECT DISTINCT name FROM symbols WHERE file_id=? AND "
-                "parent_id IS NULL", (row["id"],))][:15]
-            head = f"impact of {rel} (via {len(names)} top-level symbols)"
+            # API-level symbols: everything whose only ancestors are
+            # namespaces/modules (so C# classes inside a namespace count).
+            syms = {r["id"]: r for r in self.conn.execute(
+                "SELECT id, parent_id, kind, name FROM symbols "
+                "WHERE file_id=? ORDER BY start", (row["id"],))}
+            wrappers = ("namespace", "module")
+            all_names = []
+            for r in syms.values():
+                if r["kind"] in wrappers + ("impl",):
+                    continue
+                par = syms.get(r["parent_id"])
+                while par is not None and par["kind"] in wrappers:
+                    par = syms.get(par["parent_id"])
+                if par is None and r["name"] not in all_names:
+                    all_names.append(r["name"])
+            names = all_names[:40]
+            head = (f"impact of {rel} (via {len(names)}" +
+                    (f" of {len(all_names)}" if len(all_names) > 40 else "") +
+                    " top-level symbols)")
         else:
             rows = self._find_syms(target)
             if not rows:
@@ -578,8 +758,12 @@ class Queries:
 
     def read_span(self, file: str, start: int, end: int) -> str:
         rel = self._norm(file)
+        full = self._inside(rel) if rel else None
+        if full is None:
+            return f"outside project root: {file}" if rel \
+                else f"no such file: {file}"
         self._refresh(rel)
-        if not (self.root / rel).is_file():
+        if not full.is_file():
             return f"no such file: {file}"
         start = max(1, int(start))
         end = int(end)
@@ -606,14 +790,21 @@ class Queries:
             pass
         prov = (languages.PROVIDER or db.get_meta(c, "provider")
                 or "none loaded yet")
+        state = "; BUILD IN PROGRESS" if self.indexer.building() else ""
         return (f"root {self.root}\n{nf} files, {ns} symbols, {nr} refs, "
                 f"{ni} imports; db {size // 1024}KB\n"
-                f"grammars: {prov}; last index: {when}")
+                f"grammars: {prov}; last index: {when}{state}\n"
+                f"index v{db.INDEX_VERSION}, content search: "
+                f"{db.fts_mode(c)}")
 
-    def reindex(self, path: str = "") -> str:
+    def reindex(self, path: str = "", full: bool = False) -> str:
+        """Force-reparse one file, or reindex the project (full=True reparses
+        every file even if unchanged)."""
         rel = self._norm(path)
         if rel:
-            changed = self.indexer.refresh_file(rel)
+            if self._inside(rel) is None:
+                return f"outside project root: {path}"
+            changed = self.indexer.refresh_file(rel, force=True)
             return f"reindexed {rel}" if changed else f"unchanged: {rel}"
         self._last_check = time.time()
-        return self.indexer.index()
+        return self.indexer.index(full=full)
