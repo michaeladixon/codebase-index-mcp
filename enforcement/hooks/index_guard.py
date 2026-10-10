@@ -10,7 +10,7 @@ search_codebase, ...).
 Design principles:
   * Inert on unindexed projects (no .codebase-index/index.db found -> allow).
   * Zero capability loss: files missing from the index are always readable.
-  * Surgical reads (explicit offset + limit <= 120 lines) are always allowed --
+  * Surgical reads (explicit limit <= 120 lines) are always allowed --
     they are equivalent to read_span.
   * Non-code files (config, docs, lockfiles, markup) always pass.
   * Escape hatch: INDEX_GUARD_DISABLE=1 allows everything.
@@ -167,9 +167,9 @@ def handle_read(tool_input, cwd):
         allow()  # unindexed project: system is inert
 
     # Surgical reads are exactly what read_span does; allow them.
-    offset = tool_input.get("offset")
+    # (offset is optional: a bare limit reads the first N lines.)
     limit = tool_input.get("limit")
-    if offset is not None and limit is not None:
+    if limit is not None:
         try:
             if int(limit) <= SURGICAL_READ_MAX_LINES:
                 allow()
@@ -185,7 +185,7 @@ def handle_read(tool_input, cwd):
         "get_structure_summary('%s') for an outline, "
         "get_function_source/get_class_source for specific bodies, "
         "read_span('%s', start, end) for specific lines. "
-        "If you truly need a raw slice, re-run Read with offset and limit<=%d."
+        "If you truly need a raw slice, re-run Read with limit<=%d (plus offset)."
         % (rel, rel, SURGICAL_READ_MAX_LINES)
     )
 
@@ -222,7 +222,8 @@ def handle_grep(tool_input, cwd):
     deny(
         "This project is indexed. Use search_codebase('%s') from the "
         "codebase-index MCP server instead of Grep for code searches -- it "
-        "returns ranked symbols and spans at a fraction of the tokens. "
+        "returns ranked symbols and spans at a fraction of the tokens "
+        "(substring match by default; pass regex=True for a regex). "
         "Grep remains available for non-code files: add a glob like '*.md' "
         "or '*.json', or a non-code type filter." % pattern
     )

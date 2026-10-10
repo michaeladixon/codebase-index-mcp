@@ -34,9 +34,11 @@ def main():
             settings = json.load(f)
     hooks = settings.setdefault("hooks", {})
     ss = hooks.setdefault("SessionStart", [])
-    cmd = 'python "%s"' % dst
+    # Windows installs expose `python`; many macOS/Linux systems only `python3`.
+    exe = "python" if os.name == "nt" or shutil.which("python") else "python3"
+    cmd = '%s "%s"' % (exe, dst)
     already = any(
-        h.get("command") == cmd
+        "sessionstart_index.py" in (h.get("command") or "")
         for entry in ss for h in entry.get("hooks", [])
     )
     if already:

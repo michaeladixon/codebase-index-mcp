@@ -22,6 +22,12 @@ def main(argv: list[str] | None = None) -> int:
     st = sub.add_parser("status", help="print index stats")
     st.add_argument("root", nargs="?", default=".")
 
+    if argv is None:
+        argv = sys.argv[1:]
+    # `codebase-index-mcp <root>` is shorthand for `serve <root>`
+    if argv and argv[0] not in ("serve", "index", "status") \
+            and not argv[0].startswith("-"):
+        argv = ["serve", *argv]
     args = ap.parse_args(argv)
 
     if args.cmd == "index":

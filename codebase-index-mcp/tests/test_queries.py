@@ -151,7 +151,7 @@ def test_dependencies_file(q):
     assert "models -> Order,create_user" in s
     assert "create_user python/models.py:35" in s
     # python main() call must resolve to python, not go
-    assert "main python/app.py" in s or "main go" not in s
+    assert "main python/app.py:8" in s
 
 
 def test_dependencies_symbol(q):
